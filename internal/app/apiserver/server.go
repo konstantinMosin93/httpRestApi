@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/google/uuid"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/konstantinMosin93/httpRestApi/internal/app/model"
 	"github.com/konstantinMosin93/httpRestApi/internal/app/store"
+	"github.com/mitchellh/mapstructure"
 	"github.com/sirupsen/logrus"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -24,9 +28,12 @@ const (
 var (
 	errIncorrectEmailOrPassword = errors.New("incorrect email or password")
 	errNotAuthenticated         = errors.New("not authenticated")
+	errInvalidAuthToken         = errors.New("invalid authorization token")
 )
 
 type ctxKey int8
+
+var jwtKey = []byte("secretJwtToken")
 
 type server struct {
 	router       *mux.Router
@@ -56,12 +63,18 @@ func (s *server) configureRouter() {
 	s.router.Use(s.setRequestID)
 	s.router.Use(s.logRequest)
 	s.router.Use(handlers.CORS(handlers.AllowedOrigins([]string{"*"})))
+
 	s.router.HandleFunc("/users", s.handleUsersCreate()).Methods("POST")
 	s.router.HandleFunc("/sessions", s.handleSessionsCreate()).Methods("POST")
 
 	private := s.router.PathPrefix("/private").Subrouter()
 	private.Use(s.authenticateUser)
-	private.HandleFunc("/whoami", s.handleWhoAmI()).Methods("GET")
+	private.HandleFunc("/who", s.handleWhoAmI()).Methods("GET")
+
+	s.router.HandleFunc("/auth", s.handleTokenCreate()).Methods("POST")
+	protected := s.router.PathPrefix("/protected").Subrouter()
+	protected.Use(s.authenticateUserToken)
+	protected.HandleFunc("/who-token", s.handleWhoAmI()).Methods("GET")
 }
 
 func (s *server) setRequestID(next http.Handler) http.Handler {
@@ -115,6 +128,86 @@ func (s *server) authenticateUser(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyUser, u)))
 	})
+}
+
+func (s *server) authenticateUserToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authHeader := r.Header.Get("authorization"); authHeader != "" {
+			bearerToken := strings.Split(authHeader, " ")
+			if len(bearerToken) == 2 {
+				authToken, err := jwt.Parse(bearerToken[1], func(token *jwt.Token) (any, error) {
+					if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+						return nil, fmt.Errorf("there was an error")
+					}
+					return jwtKey, nil
+				})
+
+				if err != nil {
+					s.error(w, r, http.StatusInternalServerError, err)
+					return
+				}
+
+				if !authToken.Valid {
+					s.error(w, r, http.StatusForbidden, errInvalidAuthToken)
+					return
+				}
+
+				u := &model.User{}
+				if claims, ok := authToken.Claims.(jwt.MapClaims); ok && authToken.Valid {
+					if err := mapstructure.Decode(claims, &u); err != nil {
+						s.error(w, r, http.StatusInternalServerError, err)
+						return
+					}
+
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyUser, u)))
+				} else {
+					s.error(w, r, http.StatusForbidden, errInvalidAuthToken)
+				}
+			}
+		} else {
+			s.error(w, r, http.StatusUnauthorized, errNotAuthenticated)
+			return
+		}
+	})
+}
+
+func (s *server) handleTokenCreate() http.HandlerFunc {
+	type request struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	type jwtToken struct {
+		Token string `json:"token"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		req := &request{}
+		if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+			s.error(w, r, http.StatusBadRequest, err)
+			return
+		}
+
+		u, err := s.store.User().FindByEmail(req.Email)
+		if err != nil || !u.ComparePassword(req.Password) {
+			s.error(w, r, http.StatusUnauthorized, errIncorrectEmailOrPassword)
+			return
+		}
+
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"email":    u.Email,
+			"password": u.Password,
+			"exp":      time.Now().Add(time.Hour * time.Duration(1)).Unix(),
+		})
+
+		tokenString, err := token.SignedString(jwtKey)
+		if err != nil {
+			s.error(w, r, http.StatusInternalServerError, err)
+			return
+		}
+
+		s.respond(w, r, http.StatusOK, jwtToken{Token: tokenString})
+	}
 }
 
 func (s *server) handleWhoAmI() http.HandlerFunc {
@@ -189,7 +282,7 @@ func (s *server) error(w http.ResponseWriter, r *http.Request, code int, err err
 	s.respond(w, r, code, map[string]string{"error": err.Error()})
 }
 
-func (s *server) respond(w http.ResponseWriter, r *http.Request, code int, data interface{}) {
+func (s *server) respond(w http.ResponseWriter, r *http.Request, code int, data any) {
 	w.WriteHeader(code)
 	if data != nil {
 		err := json.NewEncoder(w).Encode(data)
